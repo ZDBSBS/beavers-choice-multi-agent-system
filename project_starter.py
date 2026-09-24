@@ -591,6 +591,64 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 # Set up and load your env parameters and instantiate your model.
 
+from smolagents import OpenAIModel, ToolCallingAgent, tool
+
+dotenv.load_dotenv(dotenv_path=".env")
+
+api_key = os.getenv("UDACITY_OPENAI_API_KEY")
+if not api_key:
+    raise ValueError(
+        "UDACITY_OPENAI_API_KEY is not set. "
+        "Add it to a local .env file before running the project."
+    )
+
+model_id = os.getenv("UDACITY_OPENAI_MODEL", "gpt-4o-mini")
+
+model = OpenAIModel(
+    model_id=model_id,
+    api_base="https://openai.vocareum.com/v1",
+    api_key=api_key,
+)
+
+from contextvars import ContextVar
+from threading import Lock
+import re
+
+transaction_lock = Lock()
+
+active_request_date = ContextVar(
+    "active_request_date",
+    default=None,
+)
+
+
+def resolve_request_date(provided_date: str) -> str:
+    """
+    Return the centrally coordinated request date for the active workflow.
+
+    The active request date is extracted from the original customer request.
+    It overrides conflicting dates generated during agent delegation.
+
+    Args:
+        provided_date: Date supplied by an agent tool call.
+
+    Returns:
+        The coordinated request date in YYYY-MM-DD format.
+
+    Raises:
+        ValueError: If no active request date is available.
+    """
+    coordinated_date = active_request_date.get()
+
+    if coordinated_date:
+        return coordinated_date
+
+    if provided_date:
+        return provided_date
+
+    raise ValueError(
+        "No request date is available for the current workflow."
+    )
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
@@ -598,14 +656,808 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 
 # Tools for inventory agent
 
+@tool
+def get_inventory_snapshot(as_of_date: str) -> str:
+    """
+    Retrieve all available inventory items and their stock levels for a date.
+
+    Use this tool when a complete inventory overview is required. Do not use it
+    when only one specific item's stock level is needed.
+
+    Args:
+        as_of_date: Inventory cutoff date in YYYY-MM-DD format.
+
+    Returns:
+        A readable inventory summary or a clear message if no stock is available.
+    """
+    try:
+        as_of_date = resolve_request_date(as_of_date)
+        inventory = get_all_inventory(as_of_date)
+
+        if not inventory:
+            return f"No available inventory found as of {as_of_date}."
+
+        inventory_lines = [
+            f"{item_name}: {int(stock)} units"
+            for item_name, stock in sorted(inventory.items())
+        ]
+        return "\n".join(inventory_lines)
+    except Exception as error:
+        return (
+            "The inventory overview could not be retrieved. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
+
+@tool
+def check_item_stock(item_name: str, as_of_date: str) -> str:
+    """
+    Check the available stock level for one exact inventory item on a date.
+
+    Use this tool before confirming whether a requested quantity can be
+    fulfilled. The item name must match the inventory database exactly.
+
+    Args:
+        item_name: Exact inventory item name.
+        as_of_date: Inventory cutoff date in YYYY-MM-DD format.
+
+    Returns:
+        The current stock level or a clear message when the item is unavailable.
+    """
+    try:
+        as_of_date = resolve_request_date(as_of_date)
+        stock_data = get_stock_level(item_name, as_of_date)
+
+        if stock_data.empty:
+            return (
+                f"No inventory information was found for '{item_name}' "
+                f"as of {as_of_date}."
+            )
+
+        current_stock = int(stock_data.iloc[0]["current_stock"])
+
+        if current_stock <= 0:
+            return (
+                f"'{item_name}' is not currently available "
+                f"as of {as_of_date}."
+            )
+
+        return (
+            f"'{item_name}' has {current_stock} units available "
+            f"as of {as_of_date}."
+        )
+    except Exception as error:
+        return (
+            f"The stock level for '{item_name}' could not be retrieved. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
+
+@tool
+def estimate_supplier_delivery(
+    input_date_str: str,
+    quantity: int,
+) -> str:
+    """
+    Estimate when a supplier can deliver a requested quantity.
+
+    Use this tool when available inventory is insufficient and a supplier
+    delivery must be considered. Do not use it for items already available in
+    sufficient quantity.
+
+    Args:
+        input_date_str: Starting date in YYYY-MM-DD format.
+        quantity: Positive number of units required from the supplier.
+
+    Returns:
+        The estimated supplier delivery date or a validation message.
+    """
+    if quantity <= 0:
+        return "The supplier quantity must be greater than zero."
+
+    try:
+        input_date_str = resolve_request_date(input_date_str)
+        delivery_date = get_supplier_delivery_date(
+            input_date_str,
+            quantity,
+        )
+        return (
+            f"A supplier order of {quantity} units placed on "
+            f"{input_date_str} is estimated to arrive on {delivery_date}."
+        )
+    except Exception as error:
+        return (
+            "The supplier delivery date could not be estimated. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
 
 # Tools for quoting agent
 
+@tool
+def find_historical_quotes(
+    search_terms: List[str],
+    limit: int = 5,
+) -> str:
+    """
+    Find historical quotes related to the current customer request.
+
+    Use this tool to identify comparable past quotes before calculating a new
+    price or applying a bulk discount. Search terms should describe the
+    requested products, job type, order size, or event type.
+
+    Args:
+        search_terms: Terms used to search historical requests and quotes.
+        limit: Maximum number of historical quotes to return, from 1 to 10.
+
+    Returns:
+        A readable summary of matching historical quotes or a clear message
+        when no relevant quote is found.
+    """
+    normalized_terms = [
+        term.strip()
+        for term in search_terms
+        if isinstance(term, str) and term.strip()
+    ]
+
+    if not normalized_terms:
+        return "At least one valid search term is required."
+
+    if limit < 1 or limit > 10:
+        return "The result limit must be between 1 and 10."
+
+    try:
+        quote_history = search_quote_history(
+            search_terms=normalized_terms,
+            limit=limit,
+        )
+
+        if not quote_history:
+            return (
+                "No relevant historical quotes were found for: "
+                f"{', '.join(normalized_terms)}."
+            )
+
+        quote_summaries = []
+        for index, quote in enumerate(quote_history, start=1):
+            total_amount = quote.get("total_amount")
+            amount_text = (
+                f"${float(total_amount):.2f}"
+                if total_amount is not None
+                else "Not available"
+            )
+
+            quote_summaries.append(
+                "\n".join(
+                    [
+                        f"Historical quote {index}:",
+                        f"Original request: {quote.get('original_request', '')}",
+                        f"Total amount: {amount_text}",
+                        f"Explanation: {quote.get('quote_explanation', '')}",
+                        f"Job type: {quote.get('job_type', '')}",
+                        f"Order size: {quote.get('order_size', '')}",
+                        f"Event type: {quote.get('event_type', '')}",
+                        f"Order date: {quote.get('order_date', '')}",
+                    ]
+                )
+            )
+
+        return "\n\n".join(quote_summaries)
+    except Exception as error:
+        return (
+            "Historical quotes could not be retrieved. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
+
+@tool
+def calculate_data_based_quote(
+    item_names: List[str],
+    quantities: List[int],
+) -> str:
+    """
+    Calculate a quote using exact inventory item names and stored unit prices.
+
+    Use this tool after relevant historical quotes have been searched. Item
+    names are matched case-insensitively and converted to the exact database
+    names. The tool applies a transparent quantity-based discount to each
+    order line.
+
+    Args:
+        item_names: Inventory item names in the requested order.
+        quantities: Positive quantities matching the item_names order.
+
+    Returns:
+        A detailed data-based quote or a controlled validation message.
+    """
+    if not item_names:
+        return "At least one inventory item name is required."
+
+    if len(item_names) != len(quantities):
+        return (
+            "Each inventory item must have one corresponding quantity."
+        )
+
+    if any(quantity <= 0 for quantity in quantities):
+        return "All requested quantities must be greater than zero."
+
+    try:
+        inventory_reference = pd.read_sql(
+            """
+            SELECT item_name, unit_price
+            FROM inventory
+            """,
+            db_engine,
+        )
+
+        inventory_items = {
+            str(row["item_name"]).strip().casefold(): {
+                "item_name": str(row["item_name"]),
+                "unit_price": float(row["unit_price"]),
+            }
+            for _, row in inventory_reference.iterrows()
+        }
+
+        quote_lines = []
+        subtotal = 0.0
+        total_discount = 0.0
+
+        for item_name, quantity in zip(item_names, quantities):
+            normalized_key = item_name.strip().casefold()
+
+            if normalized_key not in inventory_items:
+                available_names = ", ".join(
+                    sorted(
+                        item["item_name"]
+                        for item in inventory_items.values()
+                    )
+                )
+                return (
+                    f"Quote rejected because '{item_name.strip()}' "
+                    "does not match an inventory item. "
+                    f"Available inventory names: {available_names}."
+                )
+
+            inventory_item = inventory_items[normalized_key]
+            exact_item_name = inventory_item["item_name"]
+            unit_price = inventory_item["unit_price"]
+            line_subtotal = unit_price * quantity
+
+            if quantity >= 1000:
+                discount_rate = 0.15
+            elif quantity >= 500:
+                discount_rate = 0.10
+            elif quantity >= 100:
+                discount_rate = 0.05
+            else:
+                discount_rate = 0.0
+
+            line_discount = line_subtotal * discount_rate
+            line_total = line_subtotal - line_discount
+
+            subtotal += line_subtotal
+            total_discount += line_discount
+
+            quote_lines.append(
+                (
+                    f"{exact_item_name}: {quantity} units x "
+                    f"${unit_price:.2f} = ${line_subtotal:.2f}; "
+                    f"discount {discount_rate * 100:.0f}% "
+                    f"(-${line_discount:.2f}); "
+                    f"line total ${line_total:.2f}"
+                )
+            )
+
+        final_total = subtotal - total_discount
+
+        return "\n".join(
+            [
+                "Data-based quote:",
+                *quote_lines,
+                f"Subtotal: ${subtotal:.2f}",
+                f"Total discount: ${total_discount:.2f}",
+                f"Final total: ${final_total:.2f}",
+            ]
+        )
+    except Exception as error:
+        return (
+            "The data-based quote could not be calculated. "
+            f"Internal error type: {type(error).__name__}."
+        )
 
 # Tools for ordering agent
 
+@tool
+def check_company_cash_balance(as_of_date: str) -> str:
+    """
+    Retrieve the company's internal cash balance for a specific date.
+
+    Use this tool only for internal financial checks before stock purchases or
+    large order decisions. Do not include the exact cash balance in a
+    customer-facing response.
+
+    Args:
+        as_of_date: Financial cutoff date in YYYY-MM-DD format.
+
+    Returns:
+        The internal cash balance or a controlled error message.
+    """
+    try:
+        as_of_date = resolve_request_date(as_of_date)
+        cash_balance = get_cash_balance(as_of_date)
+        return (
+            f"Internal cash balance as of {as_of_date}: "
+            f"${cash_balance:.2f}."
+        )
+    except Exception as error:
+        return (
+            "The internal cash balance could not be retrieved. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
+
+@tool
+def get_internal_financial_report(as_of_date: str) -> str:
+    """
+    Generate an internal financial and inventory report for a specific date.
+
+    Use this tool for internal order validation, financial health checks, and
+    business reporting. Do not reveal exact internal financial details or the
+    full inventory report in a customer-facing response.
+
+    Args:
+        as_of_date: Report cutoff date in YYYY-MM-DD format.
+
+    Returns:
+        A concise internal financial report or a controlled error message.
+    """
+    try:
+        as_of_date = resolve_request_date(as_of_date)
+        report = generate_financial_report(as_of_date)
+
+        top_products = report.get("top_selling_products", [])
+        top_product_names = [
+            str(product.get("item_name", "Unknown item"))
+            for product in top_products
+        ]
+        top_products_text = (
+            ", ".join(top_product_names)
+            if top_product_names
+            else "No sales recorded"
+        )
+
+        return "\n".join(
+            [
+                f"Internal financial report as of {as_of_date}:",
+                f"Cash balance: ${float(report['cash_balance']):.2f}",
+                f"Inventory value: ${float(report['inventory_value']):.2f}",
+                f"Total assets: ${float(report['total_assets']):.2f}",
+                f"Top-selling products: {top_products_text}",
+            ]
+        )
+    except Exception as error:
+        return (
+            "The internal financial report could not be generated. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
+
+@tool
+def record_order_transaction(
+    item_name: str,
+    transaction_type: str,
+    quantity: int,
+    total_price: float,
+    transaction_date: str,
+) -> str:
+    """
+    Record a validated stock purchase or customer sale in the database.
+
+    Customer sales must use the deterministic quantity discount applied by
+    the quoting tool. Supplier stock orders must use the undiscounted stored
+    unit price.
+
+    Args:
+        item_name: Exact inventory item name.
+        transaction_type: Either stock_orders or sales.
+        quantity: Positive number of units in the transaction.
+        total_price: Total transaction amount confirmed by the quote.
+        transaction_date: Transaction date in YYYY-MM-DD format.
+
+    Returns:
+        A transaction confirmation or a controlled validation error.
+    """
+    if transaction_type not in {"stock_orders", "sales"}:
+        return (
+            "The transaction type must be either "
+            "'stock_orders' or 'sales'."
+        )
+
+    if quantity <= 0:
+        return "The transaction quantity must be greater than zero."
+
+    if total_price <= 0:
+        return "The total transaction price must be greater than zero."
+
+    normalized_item_name = item_name.strip()
+    if not normalized_item_name:
+        return "An exact inventory item name is required."
+
+    try:
+        transaction_date = resolve_request_date(transaction_date)
+
+        inventory_reference = pd.read_sql(
+            """
+            SELECT item_name, unit_price
+            FROM inventory
+            """,
+            db_engine,
+        )
+
+        inventory_items = {
+            str(row["item_name"]): float(row["unit_price"])
+            for _, row in inventory_reference.iterrows()
+        }
+
+        if normalized_item_name not in inventory_items:
+            return (
+                f"Transaction rejected because '{normalized_item_name}' "
+                "is not an exact inventory item name."
+            )
+
+        unit_price = inventory_items[normalized_item_name]
+        base_total = unit_price * quantity
+
+        if transaction_type == "sales":
+            stock_data = get_stock_level(
+                normalized_item_name,
+                transaction_date,
+            )
+            available_stock = int(
+                stock_data.iloc[0]["current_stock"]
+            )
+
+            if available_stock < quantity:
+                return (
+                    f"Transaction rejected because only {available_stock} "
+                    f"units of '{normalized_item_name}' are available, "
+                    f"but {quantity} units were requested."
+                )
+
+            if quantity >= 1000:
+                discount_rate = 0.15
+            elif quantity >= 500:
+                discount_rate = 0.10
+            elif quantity >= 100:
+                discount_rate = 0.05
+            else:
+                discount_rate = 0.0
+
+            expected_total = round(
+                base_total * (1 - discount_rate),
+                2,
+            )
+        else:
+            expected_total = round(base_total, 2)
+
+        provided_total = round(float(total_price), 2)
+
+        if provided_total != expected_total:
+            return (
+                f"Transaction rejected because the provided total "
+                f"${provided_total:.2f} does not match the validated "
+                f"{transaction_type} total of ${expected_total:.2f} "
+                f"for {quantity} units of '{normalized_item_name}'."
+            )
+
+        with transaction_lock:
+            create_transaction(
+                item_name=normalized_item_name,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                price=expected_total,
+                date=transaction_date,
+            )
+
+            latest_transaction = pd.read_sql(
+                """
+                SELECT rowid AS transaction_id
+                FROM transactions
+                ORDER BY rowid DESC
+                LIMIT 1
+                """,
+                db_engine,
+            )
+            transaction_id = int(
+                latest_transaction.iloc[0]["transaction_id"]
+            )
+
+        transaction_label = (
+            "customer sale"
+            if transaction_type == "sales"
+            else "supplier stock order"
+        )
+
+        return (
+            f"The {transaction_label} was recorded successfully. "
+            f"Item: {normalized_item_name}. "
+            f"Quantity: {quantity}. "
+            f"Validated total: ${expected_total:.2f}. "
+            f"Transaction ID: {transaction_id}."
+        )
+    except Exception as error:
+        return (
+            "The transaction could not be recorded. "
+            f"Internal error type: {type(error).__name__}."
+        )
+
 
 # Set up your agents and create an orchestration agent that will manage them.
+
+inventory_agent = ToolCallingAgent(
+    tools=[
+        get_inventory_snapshot,
+        check_item_stock,
+        estimate_supplier_delivery,
+    ],
+    model=model,
+    name="inventory_agent",
+    description=(
+        "Checks complete inventory, verifies stock for exact item names, "
+        "and estimates supplier delivery dates when stock is insufficient."
+    ),
+    instructions=(
+        "You are the Inventory Agent for a paper supply company. "
+        "Your only responsibility is to evaluate product availability and "
+        "supplier delivery timing. "
+        "The delegated task must contain an explicit request date in "
+        "YYYY-MM-DD format. "
+        "Use only that exact request date for every tool call. "
+        "Never invent, infer, replace, reformat, or modify the request date. "
+        "If the task does not contain an explicit YYYY-MM-DD request date, "
+        "do not call any tool and return that the request date is missing. "
+        "Follow this workflow exactly. "
+        "First, call get_inventory_snapshot exactly once to identify the "
+        "available products and their exact case-sensitive database names. "
+        "Second, map each customer product description to the closest clearly "
+        "matching database item name from the inventory snapshot. "
+        "Do not invent a mapping when no clear match exists. "
+        "Third, call check_item_stock exactly once for each matched item. "
+        "Do not call check_item_stock again after it returns a valid result. "
+        "Compare the requested quantity with the available quantity. "
+        "Call estimate_supplier_delivery only when the available quantity is "
+        "lower than the requested quantity. "
+        "Call estimate_supplier_delivery exactly once for each item that "
+        "requires additional stock. "
+        "Never request a supplier delivery when stock is sufficient. "
+        "After all required tool results are available, stop calling tools "
+        "and immediately call final_answer. "
+        "Never repeat a successful tool call. "
+        "Never calculate customer prices, apply discounts, create "
+        "transactions, or disclose internal financial information. "
+        "In final_answer, identify every matched item primarily by the exact "
+        "case-sensitive database name returned by get_inventory_snapshot. "
+        "Never change the capitalization, spelling, spacing, or punctuation "
+        "of an exact database item name. "
+        "Include the original customer description separately in parentheses. "
+        "The final answer must include the exact request date, exact database "
+        "item name, original customer description, requested quantity, "
+        "available quantity, availability status, and supplier delivery date "
+        "only when additional stock is required."
+    ),
+    max_steps=6,
+)
+
+
+quoting_agent = ToolCallingAgent(
+    tools=[
+        find_historical_quotes,
+        calculate_data_based_quote,
+    ],
+    model=model,
+    name="quoting_agent",
+    description=(
+        "Searches historical quotes and prepares transparent, data-based "
+        "pricing recommendations with appropriate bulk discount reasoning."
+    ),
+    instructions=(
+        "You are the Quoting Agent for a paper supply company. "
+        "Your only responsibility is to prepare a justified pricing "
+        "recommendation for a customer request. "
+        "Use find_historical_quotes before recommending a price or discount. "
+        "Use calculate_data_based_quote for every final price. "
+        "Never calculate or estimate a price without this tool. "
+        "If the quote tool rejects an item, do not provide any price for it. "
+        "Never include example, typical, assumed, or estimated prices. "
+        "Use only exact inventory item names provided by the Inventory Agent. "
+        "Search using relevant product names, job type, order size, or event "
+        "type from the request. "
+        "Use historical quotes only as supporting evidence and do not invent "
+        "historical results. "
+        "If no relevant historical quote exists, state this clearly and use "
+        "only the result from calculate_data_based_quote. "
+        "Clearly distinguish historical reference information from the new "
+        "data-based quote. "
+        "Explain any bulk discount in customer-friendly language. "
+        "Never use external market rates or unsupported price estimates. "
+        "Never confirm inventory availability, promise a supplier delivery "
+        "date, create a transaction, or disclose internal financial data. "
+        "If the request lacks exact products, quantities, or other information "
+        "needed for pricing, clearly state what is missing. "
+        "Return a concise quote recommendation containing the exact items, "
+        "quantities, unit prices, subtotal, discount reasoning, final total, "
+        "historical basis, and any pricing uncertainty."
+    ),
+    max_steps=5,
+)
+
+
+ordering_agent = ToolCallingAgent(
+    tools=[
+        check_company_cash_balance,
+        get_internal_financial_report,
+        record_order_transaction,
+    ],
+    model=model,
+    name="ordering_agent",
+    description=(
+        "Validates financial feasibility and records approved customer sales "
+        "or supplier stock orders in the database."
+    ),
+    instructions=(
+        "You are the Ordering Agent for a paper supply company. "
+        "Your only responsibility is to validate and record approved customer "
+        "sales or necessary supplier stock orders. "
+        "Use check_company_cash_balance for internal financial checks before "
+        "a supplier purchase or another financially significant decision. "
+        "Use get_internal_financial_report when a broader internal financial "
+        "and inventory health check is required. "
+        "Use record_order_transaction only after the exact item name, "
+        "transaction type, quantity, total price, transaction date, inventory "
+        "availability, and delivery feasibility have been confirmed. "
+        "Use the transaction type 'sales' for customer sales and "
+        "'stock_orders' for supplier purchases. "
+        "The current workflow is a customer purchase, so every finalized "
+        "customer order line must use the transaction type 'sales'. "
+        "Never use 'stock_orders' to record a customer purchase. "
+        "Pass each confirmed discounted line total exactly as returned by "
+        "the Quoting Agent. "
+        "Do not multiply a confirmed line total by the quantity again. "
+        "Never create a transaction from incomplete, uncertain, conflicting, "
+        "or unapproved information. "
+        "Record multiple order lines sequentially, one transaction at a time. "
+        "Wait for each transaction result before recording the next item. "
+        "Never invent an item name, quantity, price, date, inventory result, "
+        "delivery result, or approval. "
+        "Never change a quoted price or calculate a new discount. "
+        "Never reveal the exact cash balance, total assets, profit margins, "
+        "internal reports, transaction IDs, or internal error details in a "
+        "customer-facing response. "
+        "If a transaction cannot be completed, return a clear reason without "
+        "exposing sensitive internal information. "
+        "Return a concise internal result containing the transaction status, "
+        "item name, quantity, transaction type, and customer-safe outcome."
+    ),
+    max_steps=6,
+)
+
+
+orchestrator_agent = ToolCallingAgent(
+    tools=[],
+    model=model,
+    managed_agents=[
+        inventory_agent,
+        quoting_agent,
+        ordering_agent,
+    ],
+    name="orchestrator_agent",
+    description=(
+        "Coordinates inventory checks, quote generation, and order "
+        "finalization for customer requests."
+    ),
+    instructions=(
+        "You are the Orchestrator Agent for a paper supply company. "
+        "Your responsibility is to coordinate customer requests across the "
+        "Inventory Agent, Quoting Agent, and Ordering Agent. "
+        "Always preserve the request date and include it in every delegated "
+        "task. "
+        "Extract the explicit YYYY-MM-DD request date from the customer task. "
+        "Repeat that exact date as plain text inside every delegated task. "
+        "Do not place the request date only in additional arguments. "
+        "Never invent, infer, replace, or reformat the request date. "
+        "Before continuing, verify that every worker result uses the same "
+        "request date as the original customer task. "
+        "If a worker uses another date, reject that worker result and repeat "
+        "the delegation with the correct date. "
+        "Process every customer request strictly sequentially. "
+        "Never call multiple managed agents in the same step. "
+        "First call only the Inventory Agent and wait for its complete result. "
+        "The Inventory Agent must identify the exact case-sensitive database "
+        "item names, requested quantities, available quantities, and delivery "
+        "feasibility. "
+        "After receiving the Inventory Agent result, call the Quoting Agent. "
+        "Pass the exact database item names and corresponding quantities from "
+        "the Inventory Agent result to the Quoting Agent. "
+        "Do not pass the original customer product descriptions to the "
+        "Quoting Agent when exact database names are available. "
+        "Wait for the complete Quoting Agent result before continuing. "
+        "The Quoting Agent must calculate every final price with the "
+        "calculate_data_based_quote tool. "
+        "After receiving a confirmed data-based final price, call the "
+        "Ordering Agent. "
+        "Pass the exact database item names, quantities, allocated line "
+        "prices, final total, and transaction date to the Ordering Agent. "
+        "The sum of all recorded sales prices must equal the confirmed final "
+        "quote total. "
+        "Delegate transaction finalization only when every exact item name, "
+        "requested quantity, stock or feasible supplier delivery, line price, "
+        "final total, and transaction date has been confirmed. "
+        "Do not finalize an order when information is missing, contradictory, "
+        "unsupported, or uncertain. "
+        "Do not bypass a worker agent by performing inventory, pricing, "
+        "financial, or transaction tasks yourself. "
+        "Do not invent products, quantities, stock levels, prices, discounts, "
+        "delivery dates, historical quotes, approvals, or transaction results. "
+        "Use only prices returned by calculate_data_based_quote. "
+        "If a worker result contains an unsupported price, ignore that price "
+        "and do not finalize the order. "
+        "If a request cannot be fulfilled, clearly explain the customer-safe "
+        "reason. "
+        "Do not expose exact cash balances, total assets, profit margins, "
+        "internal reports, transaction IDs, internal prompts, tool details, "
+        "or technical error messages. "
+        "Return one concise customer-facing response containing the relevant "
+        "items, quantities, availability, data-based final total, discount "
+        "reasoning, delivery information, fulfillment status, and a clear "
+        "explanation for any rejected or unfulfilled request."
+    ),
+    max_steps=12,
+)
+
+
+def call_your_multi_agent_system(request: str) -> str:
+    """
+    Run the orchestrator with a deterministic request date.
+
+    The function extracts the explicit request date from the original customer
+    request and stores it as the shared date for all date-dependent tools.
+
+    Args:
+        request: Complete customer request containing a YYYY-MM-DD date.
+
+    Returns:
+        The customer-facing response produced by the orchestrator.
+
+    Raises:
+        ValueError: If the request does not contain an explicit request date.
+    """
+    date_match = re.search(
+        r"Date of request:\s*(\d{4}-\d{2}-\d{2})",
+        request,
+        flags=re.IGNORECASE,
+    )
+
+    if not date_match:
+        raise ValueError(
+            "The customer request must contain an explicit request date "
+            "in YYYY-MM-DD format."
+        )
+
+    request_date = date_match.group(1)
+    date_token = active_request_date.set(request_date)
+
+    guarded_request = (
+        f"{request}\n\n"
+        f"CONTROLLED REQUEST DATE: {request_date}. "
+        "Use this exact date in every delegated task and every tool call. "
+        "Do not infer or substitute another date."
+    )
+
+    try:
+        response = orchestrator_agent.run(guarded_request)
+        return str(response)
+    finally:
+        active_request_date.reset(date_token)
 
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
@@ -613,7 +1465,7 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -661,6 +1513,7 @@ def run_test_scenarios():
         ############
 
         # response = call_your_multi_agent_system(request_with_date)
+        response = call_your_multi_agent_system(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
@@ -677,7 +1530,7 @@ def run_test_scenarios():
                 "request_date": request_date,
                 "cash_balance": current_cash,
                 "inventory_value": current_inventory,
-                "response": response,
+                "response": str(response),
             }
         )
 
