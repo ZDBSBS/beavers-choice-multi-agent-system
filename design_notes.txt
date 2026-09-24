@@ -1,0 +1,302 @@
+Munder Difflin Multi-Agent System
+Reflection Report
+
+1. Project Overview
+
+The project implements a modular multi-agent sales workflow for a fictional paper supply company. The system processes customer requests, identifies matching inventory items, checks availability, prepares data-based quotes, applies transparent quantity discounts, records validated sales transactions, and returns customer-safe responses.
+
+The implementation uses smolagents and contains four agents, which remains within the project constraint of no more than five agents:
+
+1. Orchestrator Agent
+2. Inventory Agent
+3. Quoting Agent
+4. Ordering Agent
+
+The implementation is supported by an SQLite database, the supplied historical quote files, deterministic validation logic, and a transaction-verified response layer.
+
+
+2. Architecture and Workflow
+
+The architecture follows a sequential orchestration pattern. This design was selected because later decisions depend on validated outputs from earlier stages. Pricing requires exact inventory item names and quantities, while transaction finalization requires confirmed availability and validated prices.
+
+The workflow is:
+
+Customer Request
+-> Orchestrator Agent
+-> Inventory Agent
+-> Quoting Agent
+-> Ordering Agent
+-> Transaction Verification
+-> Customer-Facing Response
+
+The Orchestrator Agent receives the original customer request, extracts the explicit request date, delegates tasks to the worker agents, and combines the validated results. Delegation is performed sequentially to reduce conflicts and prevent downstream agents from acting on incomplete information.
+
+The Inventory Agent identifies exact case-sensitive database item names, checks current stock, and estimates supplier delivery dates only when inventory is insufficient.
+
+The Inventory Agent uses these tools:
+
+- get_inventory_snapshot, which uses get_all_inventory
+- check_item_stock, which uses get_stock_level
+- estimate_supplier_delivery, which uses get_supplier_delivery_date
+
+The Quoting Agent searches historical quotes and calculates a deterministic quote from stored unit prices.
+
+The Quoting Agent uses these tools:
+
+- find_historical_quotes, which uses search_quote_history
+- calculate_data_based_quote, which uses inventory unit prices and applies documented quantity discounts
+
+The Ordering Agent validates financial feasibility and records approved transactions.
+
+The Ordering Agent uses these tools:
+
+- check_company_cash_balance, which uses get_cash_balance
+- get_internal_financial_report, which uses generate_financial_report
+- record_order_transaction, which uses create_transaction
+
+All seven required starter helper functions are therefore included in agent tool definitions.
+
+
+3. Decision-Making and Validation
+
+The system combines agent reasoning with deterministic safeguards. This was an important architectural decision because language-model outputs can contain inconsistent item names, dates, transaction types, quantities, or prices.
+
+The original request date is stored in a shared ContextVar named active_request_date. Date-dependent tools resolve their input through this controlled context. If an agent generates a conflicting date, the original coordinated request date overrides it.
+
+The quote calculation is deterministic. Product names are matched case-insensitively and converted back to exact database names. Prices come from the inventory table rather than unsupported external estimates.
+
+The discount policy is:
+
+- Below 100 units: 0 percent
+- 100 to 499 units: 5 percent
+- 500 to 999 units: 10 percent
+- 1,000 units or more: 15 percent
+
+Before a transaction is stored, record_order_transaction validates:
+
+- the exact inventory item name,
+- the transaction type,
+- a positive quantity,
+- a positive total price,
+- the available stock,
+- the controlled request date,
+- and the expected data-based price.
+
+Invalid transactions are rejected without changing inventory or cash.
+
+A transaction lock serializes database writes and helps preserve unique transaction IDs. The final response is reconciled with newly recorded sales through build_transaction_verified_response. This prevents an inconsistent agent statement from overriding the actual database result.
+
+
+4. Evaluation Results
+
+The system was evaluated with the complete quote_requests_sample.csv dataset. All 20 provided requests were processed and documented in test_results.csv.
+
+The completed evaluation produced:
+
+- Total requests processed: 20
+- Requests with cash-balance changes: 9
+- Recorded customer sales: 13
+- Unique sales transaction IDs: 13
+- Total recorded additional revenue: $1,179.42
+- Final cash balance: $46,239.12
+- Final inventory value: $3,655.45
+
+The results satisfy the project evaluation requirements:
+
+- More than three requests changed the cash balance.
+- More than three quote requests were successfully or partially fulfilled.
+- Not all requests were fulfilled.
+- Unfulfilled requests included customer-safe reasons such as insufficient stock, unavailable products, product-name mismatches, price-validation failures, or delivery constraints.
+
+A verified successful example processed:
+
+- 200 units of Glossy paper
+- 100 units of Cardstock
+- 100 units of Colored paper
+
+The stored line totals were:
+
+- Glossy paper: $38.00
+- Cardstock: $14.25
+- Colored paper: $9.50
+
+The validated final total was $61.75. The cash balance increased by exactly $61.75, while the inventory was reduced by 200, 100, and 100 units respectively.
+
+The evaluation also demonstrated partial fulfillment. A request could result in a confirmed sale for an available product while unavailable items were excluded and explained to the customer. This behavior is more realistic than treating every multi-item request as entirely successful or entirely unsuccessful.
+
+
+5. Strengths of the System
+
+5.1 Clear Separation of Responsibilities
+
+Each agent has one primary competence.
+
+The Inventory Agent manages availability and delivery timing. The Quoting Agent manages pricing and discounts. The Ordering Agent manages transaction finalization. The Orchestrator Agent coordinates the complete workflow.
+
+This separation improves readability, maintainability, traceability, and logical reasoning.
+
+
+5.2 Deterministic Business Validation
+
+Critical business operations do not rely only on language-model judgment. Dates, product names, prices, quantities, stock levels, and transaction types are validated programmatically.
+
+This validation prevented incorrectly scaled prices and invalid stock-order transactions from being saved during testing.
+
+
+5.3 Explainable Pricing
+
+Quotes show:
+
+- unit prices,
+- line subtotals,
+- discount rates,
+- discount amounts,
+- line totals,
+- and the final total.
+
+This makes customer-facing pricing transparent and supports the industry best-practice requirement for explainable outcomes.
+
+
+5.4 Database-Consistent Responses
+
+The response-verification layer constructs the final customer response from the transactions actually saved during the current request.
+
+This protects customers from receiving quantities or prices that differ from the database state.
+
+
+5.5 Safe Handling of Sensitive Information
+
+The API key is loaded from a local .env file and excluded from Git.
+
+Customer-facing responses do not intentionally expose:
+
+- internal cash balances,
+- total assets,
+- internal financial reports,
+- transaction IDs,
+- internal prompts,
+- or technical error details.
+
+
+5.6 Reproducible Evaluation
+
+The database initialization uses a fixed seed. The test_results.csv file is updated after every completed request.
+
+Checkpoint saving protects completed evaluation results if a long evaluation run is interrupted.
+
+
+6. Limitations and Challenges
+
+The main challenge was the variability of language-model tool calls.
+
+During development, agents generated:
+
+- incorrect dates,
+- non-exact product names,
+- incorrectly scaled prices,
+- unsupported prices,
+- and the wrong transaction type.
+
+These issues were addressed with deterministic tool validation, controlled request-date state, exact item-name checks, price verification, transaction locking, and transaction-based response reconciliation.
+
+Product mapping remains dependent on the Inventory Agent recognizing a clear relationship between a customer description and an available database item.
+
+Ambiguous descriptions can still lead to a rejected or partially fulfilled request. This is safer than inventing a product match, but it can reduce the fulfillment rate.
+
+The current pricing policy is deterministic and explainable, but the discount thresholds are business rules introduced for this implementation. A production system would ideally load discount rules from a configurable policy table.
+
+The evaluation also requires multiple model calls per request. This increases execution time and API usage, especially for requests containing several products or ambiguous terminology.
+
+
+7. Suggested Improvements
+
+7.1 Add a Deterministic Product-Matching Service
+
+A dedicated product-matching component could normalize:
+
+- synonyms,
+- dimensions,
+- colors,
+- units,
+- and common customer descriptions.
+
+The component could use a curated alias table or embedding-based retrieval with confidence thresholds. Low-confidence matches would still require clarification.
+
+This would improve fulfillment without sacrificing transaction safety.
+
+
+7.2 Move Pricing and Discount Rules to Configuration
+
+Unit prices already come from the database, but discount thresholds are currently defined in Python.
+
+A future version should store discount policies in a database table or configuration file. This would allow business users to update pricing policies without changing application code.
+
+
+7.3 Add Transaction-Level Evaluation Fields
+
+The current test_results.csv contains:
+
+- request_id,
+- request_date,
+- cash_balance,
+- inventory_value,
+- and response.
+
+Additional fields could include:
+
+- fulfillment_status,
+- sold_items,
+- rejected_items,
+- recorded_total,
+- cash_change,
+- and rejection_reason.
+
+These fields would make evaluation more precise and reduce reliance on keyword analysis.
+
+
+7.4 Reduce Model Calls and Improve Performance
+
+The orchestration could pass compact structured results between agents instead of verbose natural-language summaries.
+
+Deterministic preprocessing could also extract dates, products, quantities, and deadlines before agent delegation.
+
+These changes would reduce token usage, latency, and opportunities for inconsistent interpretation.
+
+
+7.5 Add Automated Regression Tests
+
+A production-ready version should include automated tests for:
+
+- request-date coordination,
+- price validation,
+- inventory updates,
+- cash-balance updates,
+- duplicate transaction prevention,
+- partial fulfillment,
+- unavailable products,
+- exact product-name validation,
+- and customer-safe response generation.
+
+These tests would protect the deterministic safeguards during future changes.
+
+
+8. Conclusion
+
+The final system meets the core architectural and evaluation requirements.
+
+The solution:
+
+- uses a four-agent smolagents architecture,
+- includes a central Orchestrator Agent,
+- implements distinct Inventory, Quoting, and Ordering Agents,
+- integrates all seven required starter helper functions into tools,
+- processes the complete evaluation dataset,
+- records valid transactions,
+- explains discounts and fulfillment decisions,
+- and protects internal information.
+
+The strongest aspect of the implementation is the combination of agent specialization with deterministic business controls.
+
+Agents provide flexible interpretation and orchestration, while programmatic validation protects the database and the customer response from inconsistent model outputs.
+
+The resulting design is modular, explainable, reproducible, and suitable as a foundation for a more advanced production sales workflow.
