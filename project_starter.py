@@ -1415,18 +1415,88 @@ orchestrator_agent = ToolCallingAgent(
 )
 
 
+def build_transaction_verified_response(
+    request_date: str,
+    initial_transaction_id: int,
+    agent_response: str,
+) -> str:
+    """
+    Build a customer-facing response from verified database transactions.
+
+    The function replaces potentially inconsistent agent claims with the
+    customer sales that were actually recorded during the current request.
+
+    Args:
+        request_date: Coordinated request date in YYYY-MM-DD format.
+        initial_transaction_id: Highest transaction row ID before processing.
+        agent_response: Original response produced by the orchestrator.
+
+    Returns:
+        A customer-safe response consistent with the database state.
+    """
+    recorded_sales = pd.read_sql(
+        """
+        SELECT
+            rowid AS transaction_id,
+            item_name,
+            units,
+            price,
+            transaction_date
+        FROM transactions
+        WHERE rowid > :initial_transaction_id
+          AND transaction_type = 'sales'
+          AND item_name IS NOT NULL
+        ORDER BY rowid
+        """,
+        db_engine,
+        params={
+            "initial_transaction_id": initial_transaction_id,
+        },
+    )
+
+    if recorded_sales.empty:
+        return str(agent_response)
+
+    sales_lines = []
+    for sale in recorded_sales.itertuples(index=False):
+        sales_lines.append(
+            f"- {int(sale.units)} units of {sale.item_name}: "
+            f"${float(sale.price):.2f}"
+        )
+
+    recorded_total = float(recorded_sales["price"].sum())
+
+    return "\n".join(
+        [
+            f"Your order was processed on {request_date}.",
+            "",
+            "The following customer sales were successfully recorded:",
+            *sales_lines,
+            "",
+            f"Recorded total: ${recorded_total:.2f}.",
+            "",
+            (
+                "Any requested items not listed above were not recorded. "
+                "Those items could not be confirmed under the available "
+                "inventory, product-matching, pricing, or delivery conditions."
+            ),
+        ]
+    )
+
+
 def call_your_multi_agent_system(request: str) -> str:
     """
     Run the orchestrator with a deterministic request date.
 
     The function extracts the explicit request date from the original customer
-    request and stores it as the shared date for all date-dependent tools.
+    request, stores it as the shared date for all date-dependent tools, and
+    reconciles the final response with recorded customer transactions.
 
     Args:
         request: Complete customer request containing a YYYY-MM-DD date.
 
     Returns:
-        The customer-facing response produced by the orchestrator.
+        A transaction-verified customer-facing response.
 
     Raises:
         ValueError: If the request does not contain an explicit request date.
@@ -1446,6 +1516,17 @@ def call_your_multi_agent_system(request: str) -> str:
     request_date = date_match.group(1)
     date_token = active_request_date.set(request_date)
 
+    transaction_state = pd.read_sql(
+        """
+        SELECT COALESCE(MAX(rowid), 0) AS max_transaction_id
+        FROM transactions
+        """,
+        db_engine,
+    )
+    initial_transaction_id = int(
+        transaction_state.iloc[0]["max_transaction_id"]
+    )
+
     guarded_request = (
         f"{request}\n\n"
         f"CONTROLLED REQUEST DATE: {request_date}. "
@@ -1454,8 +1535,16 @@ def call_your_multi_agent_system(request: str) -> str:
     )
 
     try:
-        response = orchestrator_agent.run(guarded_request)
-        return str(response)
+        response = orchestrator_agent.run(
+            guarded_request,
+            reset=True,
+        )
+
+        return build_transaction_verified_response(
+            request_date=request_date,
+            initial_transaction_id=initial_transaction_id,
+            agent_response=str(response),
+        )
     finally:
         active_request_date.reset(date_token)
 
