@@ -22,7 +22,6 @@ env/
 *.sqlite3
 
 # Generated test output
-test_results.csv
 
 # Editor and operating system files
 .vscode/

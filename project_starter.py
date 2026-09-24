@@ -1534,6 +1534,15 @@ def run_test_scenarios():
             }
         )
 
+        pd.DataFrame(results).to_csv(
+            "test_results.csv",
+            index=False,
+        )
+        print(
+            f"Checkpoint saved: {len(results)} of "
+            f"{len(quote_requests_sample)} requests."
+        )
+
         time.sleep(1)
 
     # Final report
